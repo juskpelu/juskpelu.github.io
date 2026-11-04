@@ -1,4 +1,7 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style>
+</head><body>
 <title>Trivia Gambit</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -225,7 +228,7 @@ h1 span{color:var(--accent)}
           <li><b>Kings capture for free.</b> No question when the king does the taking.</li>
           <li>Miss a capture while your king is in check and your king falls.</li>
           <li>The computer is <b>Stockfish</b> at the strength you pick. It answers questions too: easy 80% of the time, medium 65%, hard 50%.</li>
-          <li><b>Online</b>: create a game and send your friend the code. They need access to this page (Contributor or higher) to join.</li>
+          <li id="onlineRule"><b>Online</b>: create a game and send your friend the code. They need access to this page (Contributor or higher) to join.</li>
         </ul>
       </div>
     </aside>
@@ -639,6 +642,59 @@ function choosePromo(col,cb){card.innerHTML=`<div class="card-top"><span class="
   card.querySelectorAll("[data-p]").forEach(b=>b.addEventListener("click",()=>{overlay.hidden=true;busy=false;cb(b.dataset.p);}));
   card.querySelector("[data-p]").focus({preventScroll:true});}
 
+
+// ---------- Peer-to-peer online (used when the page runs outside claude.ai) ----------
+const PEER_SRC="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js";
+const PFX="trivia-gambit-v1-";
+function localPlayerId(){let id=null;try{id=localStorage.getItem("tg-player-id");}catch(e){}
+  if(!id){id="p"+Math.random().toString(36).slice(2,12)+Date.now().toString(36);try{localStorage.setItem("tg-player-id",id);}catch(e){}}return id;}
+function loadPeerLib(){return new Promise(res=>{if(window.Peer)return res(true);const sc=document.createElement("script");sc.src=PEER_SRC;sc.onload=()=>res(!!window.Peer);sc.onerror=()=>res(false);document.head.appendChild(sc);setTimeout(()=>res(!!window.Peer),12000);});}
+function makePeerDb(){
+  let sess=null;
+  const note=t=>{onlineNote=t;renderOnlinePanel();};
+  const opts=()=>window.TG_PEER_OPTS||{};
+  function end(){if(!sess)return;sess.closed=true;try{sess.peer&&sess.peer.destroy();}catch(e){}sess=null;}
+  function newSess(code,role){end();sess={code,role,doc:null,conns:[],hostConn:null,listeners:[],peer:null,closed:false};return sess;}
+  function emit(x){if(!x.doc)return;const d=JSON.parse(JSON.stringify(x.doc));x.listeners.forEach(fn=>setTimeout(()=>{if(!x.closed)fn({exists:true,data:()=>d});},0));
+    if(x.role==="host")try{localStorage.setItem("tg-host-"+x.code,JSON.stringify(x.doc));}catch(e){}}
+  function broadcast(x){x.conns.forEach(c=>{if(c.open)c.send({type:"doc",doc:x.doc});});}
+  function host(x,tries){const p=new Peer(PFX+x.code,opts());x.peer=p;
+    p.on("open",()=>{if(onlineNote&&/host|connect/i.test(onlineNote))note("");});
+    p.on("connection",conn=>{x.conns.push(conn);
+      conn.on("data",msg=>{if(x.closed||!msg)return;
+        if(msg.type==="hello"){conn.playerId=msg.id;const d=x.doc;
+          if(!d.black&&msg.id!==d.white){d.black=msg.id;d.status="playing";d.updatedAt=Date.now();emit(x);broadcast(x);}
+          else conn.send({type:"doc",doc:d});}
+        else if(msg.type==="update"&&msg.body&&(conn.playerId===x.doc.white||conn.playerId===x.doc.black)){Object.assign(x.doc,msg.body);emit(x);broadcast(x);}});
+      conn.on("close",()=>{x.conns=x.conns.filter(c=>c!==conn);if(!x.closed&&conn.playerId&&conn.playerId===x.doc.black&&x.doc.status==="playing")note("Your opponent disconnected. They can rejoin with the same code.");});});
+    p.on("disconnected",()=>{if(!x.closed)try{p.reconnect();}catch(e){}});
+    p.on("error",e=>{if(x.closed)return;
+      if(e.type==="unavailable-id"&&tries<12){note("Reopening your game…");try{p.destroy();}catch(_){}setTimeout(()=>{if(!x.closed)host(x,tries+1);},4000);}
+      else if(e.type==="network"||e.type==="server-error"||e.type==="socket-error")note("Can't reach the matchmaking server. Check your internet connection.");});}
+  function guest(x){const p=new Peer(undefined,opts());x.peer=p;let tries=0;
+    const connect=()=>{if(x.closed)return;const c=p.connect(PFX+x.code,{reliable:true});x.hostConn=c;
+      const t=setTimeout(()=>{if(!c.open&&!x.closed){note("Still trying to reach the host…");}},8000);
+      c.on("open",()=>{clearTimeout(t);tries=0;if(onlineNote)note("");c.send({type:"hello",id:me});const ob=x.outbox||[];x.outbox=[];ob.forEach(body=>c.send({type:"update",body}));});
+      c.on("data",msg=>{if(msg&&msg.type==="doc"&&!x.closed){x.doc=msg.doc;emit(x);}});
+      c.on("close",()=>{clearTimeout(t);if(x.closed)return;note("Lost the connection to the host. Reconnecting…");setTimeout(connect,3000);});};
+    p.on("open",connect);
+    p.on("disconnected",()=>{if(!x.closed)try{p.reconnect();}catch(e){}});
+    p.on("error",e=>{if(x.closed)return;
+      if(e.type==="peer-unavailable"){tries++;if(tries>=3&&!x.doc){note(`No game is open with code ${x.code}. The host needs to keep their game tab open.`);}else setTimeout(connect,3000);}
+      else if(e.type==="network"||e.type==="server-error"||e.type==="socket-error")note("Can't reach the matchmaking server. Check your internet connection.");});}
+  return {p2p:true,
+    doc(path){const code=path.split("/")[1];return{
+      async set(body){const x=newSess(code,"host");x.doc=JSON.parse(JSON.stringify(body));host(x,0);emit(x);},
+      async update(body){const x=sess;if(!x||x.code!==code||!x.doc)throw{message:"not connected"};
+        if(x.role==="host"){Object.assign(x.doc,JSON.parse(JSON.stringify(body)));emit(x);broadcast(x);}
+        else{Object.assign(x.doc,JSON.parse(JSON.stringify(body)));emit(x);
+          if(x.hostConn&&x.hostConn.open)x.hostConn.send({type:"update",body});else{(x.outbox=x.outbox||[]).push(body);note("Not connected to the host. Your move will send when the connection is back.");}}},
+      onSnapshot(next){let x=sess;
+        if(!x||x.code!==code){let saved=null;try{saved=JSON.parse(localStorage.getItem("tg-host-"+code)||"null");}catch(e){}
+          if(saved&&saved.white===me){x=newSess(code,"host");x.doc=saved;host(x,0);}else{x=newSess(code,"guest");guest(x);}}
+        x.listeners.push(next);if(x.role==="host")emit(x);
+        return ()=>{if(sess===x)end();};}};}};}
+
 // ---------- Online ----------
 let db=null,user=null,me=null,canWrite=null,lobby=[],lobbyUnsub=null,onlineNote="",onlineReady=false;
 let writeQ=Promise.resolve(),localSeq=0;
@@ -663,6 +719,7 @@ async function createGame(){if(!db||!me)return;
   onlineNote="";watchGame(code);}
 async function joinGame(code){code=String(code||"").trim().toUpperCase();if(!/^[A-Z0-9]{5}$/.test(code)){onlineNote="Game codes are 5 letters and numbers.";renderOnlinePanel();return;}
   if(!db){return;}
+  if(db.p2p){onlineNote="Connecting to the host…";watchGame(code);return;}
   const ref=db.doc("games/"+code);onlineNote="Joining…";renderOnlinePanel();
   try{let snap=await ref.get();
     if(!snap.exists){onlineNote=`No game found with code ${code}.`;renderOnlinePanel();return;}
@@ -707,7 +764,7 @@ function showPending(p){const who=(names[p.col]||"Your opponent")+" is answering
 function showReveal(a,cb){const who=names[a.col]||"Your opponent";card.innerHTML=cardHTML(a,{interactive:false,who});overlay.hidden=false;busy=true;
   const ok=a.pick===a.ans;markCard(a.ans,a.pick,a.pick<0?`${who} ran out of time. Capture blocked.`:ok?`${who} got it. Capture made.`:`${who} missed. Capture blocked.`,ok);
   const gid=gameId;setTimeout(()=>{if(gid!==gameId)return;overlay.hidden=true;busy=false;cb();},1600);}
-function startLobby(){if(!db||lobbyUnsub||mode!=="online"||online)return;
+function startLobby(){if(!db||db.p2p||lobbyUnsub||mode!=="online"||online)return;
   try{lobbyUnsub=db.collection("games").where("status","==","waiting").limit(40).onSnapshot(snap=>{
     lobby=snap.docs.map(x=>x.data()).filter(g=>g.createdAt>Date.now()-12*3600e3).sort((a,b)=>b.createdAt-a.createdAt);
     renderOnlinePanel();},()=>{lobby=[];renderOnlinePanel();});}catch(e){}}
@@ -718,7 +775,7 @@ async function loadHostNames(ids){const need=ids.filter(i=>i&&!(i in hostNames))
 function renderOnlinePanel(){const el=$("onlinePanel");if(mode!=="online")return;
   const note=onlineNote?`<p class="note${/n't|No |need|Lost|exist/.test(onlineNote)?" warn":""}">${esc(onlineNote)}</p>`:"";
   if(!onlineReady){el.innerHTML=`<h4>Online</h4><p class="note">Connecting…</p>`;return;}
-  if(!db||!me){el.innerHTML=`<h4>Online</h4><p class="note warn">Online play needs you signed in to claude.ai with access to this page. You can still play the computer or a friend on this device.</p>`;return;}
+  if(!db||!me){el.innerHTML=`<h4>Online</h4><p class="note warn">Online play isn't available here. Make sure you're signed in and have access to this page. You can still play the computer or a friend on this device.</p>`;return;}
   if(online){const d=online.doc;
     const role=online.color?`You play ${online.color==="w"?"White":"Black"}`:"You're watching";
     el.innerHTML=`<h4>Online game</h4>
@@ -737,7 +794,7 @@ function renderOnlinePanel(){const el=$("onlinePanel");if(mode!=="online")return
     <div class="row"><button class="btn" id="createBtn"${canWrite===false?" disabled":""}>Create ${esc(VARIANTS[variant].name)} game</button></div>
     <div class="row"><label class="note" for="codeInp">Have a code?</label><input class="inp" id="codeInp" maxlength="5" autocomplete="off" placeholder="ABCDE"><button class="btn ghost" id="joinBtn">Join</button></div>
     ${canWrite===false?'<p class="note warn">You have view-only access, so you can watch games but not play. Ask the owner for Contributor access.</p>':""}
-    ${note}<h4>Open games</h4>${list}`;
+    ${note}${db.p2p?'<p class="note">Your browser hosts games you create, so keep the tab open until the game ends.</p>':'<h4>Open games</h4>'+list}`;
   $("createBtn").onclick=createGame;
   const ji=$("codeInp");$("joinBtn").onclick=()=>joinGame(ji.value);ji.onkeydown=e=>{if(e.key==="Enter")joinGame(ji.value);};
   el.querySelectorAll("[data-join]").forEach(b=>b.onclick=()=>joinGame(b.dataset.join));}
@@ -745,6 +802,10 @@ function renderOnlinePanel(){const el=$("onlinePanel");if(mode!=="online")return
 async function initOnline(){
   try{if(window.claude&&claude.use){[db,user]=await Promise.all([claude.use("db"),claude.use("user")]);
     if(user){me=await user.id();try{canWrite=await user.can("data.write");}catch(e){}}}}catch(e){db=null;}
+  if(!window.claude){
+    const ok=await loadPeerLib();
+    if(ok){db=makePeerDb();me=localPlayerId();canWrite=true;const r=$("onlineRule");if(r)r.innerHTML="<b>Online</b>: create a game and send your friend the code. Keep your tab open while you play, because your browser hosts the game.";}
+    else{const ob=document.querySelector('[data-mode="online"]');if(ob)ob.hidden=true;const r=$("onlineRule");if(r)r.hidden=true;onlineReady=true;return;}}
   onlineReady=true;
   const h=(location.hash||"").slice(1).toUpperCase();
   if(db&&me&&/^[A-Z0-9]{5}$/.test(h)){mode="online";freshLocal();refreshChrome();joinGame(h);}
